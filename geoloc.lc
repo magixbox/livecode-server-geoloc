@@ -1,0 +1,592 @@
+<?lc
+#!/opt/lcserver7/livecode-community-server
+
+# ======================================================
+# Livecode server geoloc service
+# ======================================================
+# Support query with ip, like geoloc.lc?ip=xx.xx.xxx.xx
+# default to use the client IP if ip is not provided.
+# Web server needs to have livecode server installed (works with community version).
+# Demo at https://magixbox.on-rev.com/geoloc/geoloc.lc
+
+# geoloc data from:
+#   https://www.maxmind.com/en/open-source-data-and-api-for-ip-geolocation
+# Import the geolite2 database directly using sqlite3 client manually,
+# keep the columns, just change the table to 'block' and 'loc'.
+# See seperate note for creating the database or download it here at:
+#   https://magixbox.on-rev.com/geoloc/geoloc.db.bz2 (64 Mb, likely out of date)
+
+# All source code here:-
+#   https://github.com/magixbox/livecode-server-geoloc
+
+# by bei 
+# magixbox@gmail.com
+# 2019-02
+
+global gHttp
+
+# sqlite3 database, full path if it is not staying at the same location
+constant tGeoDb    = "geoloc.db"
+constant tVerBuild = "2.0"
+
+geoloc
+
+on geoloc
+  # return the user location based on IP
+  # expect: ip, format (json,xml,line)
+
+  if $_GET["ip"] = "" then
+    put $_SERVER["REMOTE_ADDR"] into tIP
+  else
+    put $_GET["ip"] into tIP
+  end if
+
+  put geoloc_get(tIP) into tmp
+  put geoloc_response(tmp) into htmltmp
+
+  put header "Content-type: "& gHttp["Content-type:"] &"; charset=utf-8"
+  put header "Connection: close"
+  put header "Content-length: "& length(htmltmp)
+
+  put htmltmp
+end geoloc
+
+function geoloc_get theIP
+  #! return geoloc info array based on theIP
+  # _status = ERR, NOT_FOUND, FOUND
+
+  put "ERR" into geoinfo["_status"]
+  if theIP = "" then return geoinfo
+
+  # block database
+  set itemdel to "."
+  if last item of theIP is not a number then
+    # not IP
+    put line 1 of hostnameToAddress(theIP) into theIP
+  end if
+  set itemdel to ","
+
+  # open db
+  put the long seconds into tStart
+  put "_db" into spec["_host"]
+  put sqlite3_f_open(spec,tGeoDb) into dbID
+
+  # search cache
+  if geoloc_cache_get(theIP,geoinfo,dbID) then
+    return geoinfo
+  end if
+
+ # put ipNum into geoinfo["_ipnum"]
+  if not geoloc_get_l_block_addr(theIP,geoinfo,dbID) then
+    if geoloc_prIP(theIP) then
+      put "PRIVATE" into geoinfo["_status"]
+    else
+      put "NOT_FOUND" into geoinfo["_status"]
+    end if
+    return geoinfo
+  end if
+
+  # location database
+  if not geoloc_get_l_loc(geoinfo["locid"],geoinfo,dbID) then
+    put "NO_LOCATION_DETAIL" into geoinfo["_status"]
+    return geoinfo
+  end if
+
+  get geoloc_get_l_asn_addr(theIP,geoinfo,dbID)
+
+  put "FOUND" into geoinfo["_status"]
+  put the long seconds - tStart into geoinfo["_time_used"]
+  put tVerBuild into geoinfo["_version"]
+
+  # cache it
+  get geoloc_cache_set(theIP,geoinfo,dbID)
+
+  return geoinfo
+end geoloc_get
+
+function geoloc_cache_get theIP,@geoinfo,dbID
+  # search ip from cache
+  put "SELECT data FROM cache WHERE ip = '"& theIP &"' LIMIT 1;" into sqlcmd
+  local cache1
+  get sqlite3_f_query(dbID,sqlcmd,cache1)
+  
+  if cache1["_row"] > 0 then
+    put cache1["data",1] into geoinfo
+    split geoinfo by ";" and "="
+    put "check" into geoinfo["_cache"]
+    return true
+  else
+    return false
+  end if
+end geoloc_cache_get
+
+function geoloc_cache_set theIP,@geoinfo,dbID
+  # store the cache result
+  put geoinfo into data1
+  combine data1 by ";" and "="
+  replace "'" with "^" in data1
+  put "INSERT INTO cache (ip,data) VALUES ('"& theIP &"','"& data1 &"');" into sqlcmd
+  get sqlite3_f_query(dbID,sqlcmd,sql)
+end geoloc_cache_set
+
+function geoloc_get_l_block_addr ipRaw,@geoinfo,dbID
+  # lookup the ipRaw
+  
+  # step true 32 search query to find the hit
+  put "24,23,22,21,25,17,26,19,18,27,16,28,20,15,13,29,30,14,32,31,1,2,3,4,5,6,7,8,9,10,11,12" into bestHitSeq
+  put 0 into k
+  repeat for each item c in bestHitSeq
+    add 1 to k
+    put geoloc_ipWithSM(ipRaw,c) into ipSM
+    put "SELECT geoname_id locid,postal_code postalcode,latitude,longitude FROM block WHERE network = '"& ipSM &"' LIMIT 1;" into sqlcmd
+    put "" into sql
+    get sqlite3_f_query(dbID,sqlcmd,sql)
+    if sql["_row"] > 0 then
+      put ipSM into geoinfo["_match"]
+      exit repeat
+    end if
+  end repeat
+
+  if sql["_row"] = 0 then
+    return false
+  else
+    put k into geoinfo["_recur"]
+    repeat for each item tkey in "locid,postalcode,latitude,longitude"
+      put sql[tkey,1] into geoinfo[tkey]
+    end repeat
+    return true
+  end if
+end geoloc_get_l_block_addr
+
+function geoloc_get_l_asn_addr ipRaw,@geoinfo,dbID
+  # lookup the with asn table
+  
+  # step true 32 search query to find the hit
+  repeat with c = 32 down to 1
+    put geoloc_ipWithSM(ipRaw,c) into ipSM
+    put "SELECT autonomous_system_number asn,autonomous_system_organization aso FROM asn WHERE network = '"& ipSM &"' LIMIT 1;" into sqlcmd
+    put "" into sql
+    get sqlite3_f_query(dbID,sqlcmd,sql)
+    if sql["_row"] > 0 then
+      put ipSM into geoinfo["_match"]
+      exit repeat
+    end if
+  end repeat
+
+  if sql["_row"] = 0 then
+    return false
+  else
+    put sql["asn",1] into geoinfo["asn"]
+    put sql["aso",1] into geoinfo["aso"]
+    return true
+  end if
+end geoloc_get_l_asn_addr
+
+function geoloc_get_l_loc locid,@geoinfo,dbID
+  # lookup the location detail
+  if locid is not a number then return false
+
+  put "continent_code,metro_code,continent_name,country_iso_code,country_name,subdivision_1_name,city_name" into locKey
+
+  put "SELECT "& locKey &" FROM loc WHERE geoname_id = '"& locid &"' LIMIT 1;" into sqlcmd
+
+  local info
+  get sqlite3_f_query(dbID,sqlcmd,info)
+
+  if info["_row"] = 0 then return false
+  
+  put info["continent_code",1] into geoinfo["continent_code"]
+  put info["continent_name",1] into geoinfo["region"]
+  put info["country_iso_code",1] into geoinfo["country"]
+  put info["country_name",1] into geoinfo["country_name"]
+  put info["subdivision_1_name",1] into geoinfo["state"]
+  put info["city_name",1] into geoinfo["city"]
+  put info["metro_code",1] into geoinfo["metrocode"]
+
+  return true
+end geoloc_get_l_loc
+
+function geoloc_prIP ipSpec
+  # return true if ipSpec is privateIP
+  if ipSpec = "" then return false
+
+  split ipSpec by "."
+
+  if ipSpec[1] = 10 then return true
+  if ipSpec[1] = 127 then return true
+  if (ipSpec[1] = 192) and (ipSpec[2] = 168) then return true
+  if ipSpec[1] = 172 then
+    if (ipSpec[2] > 15) and (ipSpec[2] < 32) then
+      return true
+    end if
+  end if
+
+  return false
+end geoloc_prIP
+
+function geoloc_ipWithSM ipRaw,smNum
+  # return proper x.x.x.x/y format for ipRaw
+  if smNum = 32 then return ipRaw &"/"& smNum
+  
+  put IPCalc(ipRaw &"/"& smNum) into ipSpec
+  return ipSpec["subnetaddr"] &"/"& smNum
+end geoloc_ipWithSM
+
+function IPCalc theIPAddress,theSubnetMask
+  /* IPCalc yyy
+  Syntax:
+  IPCalc theIPAddress, [theSubnetMask]
+  Examples:
+  
+  Description:
+  Derive Internet values from either CIDR notation in the IPAddress
+  or a standard IP and subnet mask
+  
+  Input: 
+  .    theIPAddress -  the IP address in CIDR notation
+  or
+  .    theIPAddress - a standard IP address and
+  .     theSubNetMask - a standard subNetMask
+  
+  Returns an array of the following values:
+  .   bcastaddr
+  .   cidraddr
+  .   cidrdepth
+  .   firstaddr
+  .   ipaddress
+  .   lastaddr
+  .   subnetaddr
+  .   subnetmask
+  .   usablecount
+  Returns a string beginning with ERROR: if the parameters are out of range
+  Check that the returned value is an array to see if there was an error
+  
+  Source:
+  Bob Sneidar,  slylabs13 at icloud.com
+  IPCalc */
+  set the itemdelimiter to "."
+  
+  -- check parameters
+  -- the IP address must be 4 octets of numbers
+  if the number of items of theIPAddress <> 4 \
+        or the last char of theIPAddress is "." \
+        or ".." is in theIPAddress then
+    return "ERROR: The IP Address must be in the form:" & cr & \
+          "'nnn.nnn.nnn.nnn' or 'nnn.nnn.nnn.nnn/nn'. (ipaddress = '" & theIPAddress & "')"
+  end if
+  
+  -- initial setup
+  set the numberFormat to "00000000"
+  
+  -- detemine format
+  if theIPAddress contains "/" then
+    set itemdel to "/"
+    put item 2 of theIPAddress into theCIDRDepth
+    put item 1 of theIPAddress into theIPAddress
+    set itemdel to "."
+#    put offset("/", theIPAddress) into theCIDRDelim
+#    put char theCIDRDelim +1 to -1 of theIPAddress into theCIDRDepth
+    
+    -- CIDR depth must be a WHOLE number
+    #      put cleanString(theCIDRDepth) into theCIDRDepth
+    
+    if theCIDRDepth is not a number then
+      return "ERROR: The CIDR Depth must be a number between 0 and 32. "& \
+            "(CIDRDepth = '" & theCIDRDepth & "')"
+    end if
+    
+    put IPCalc_charx("1", theCIDRDepth) & IPCalc_charx("0", 32 - theCIDRDepth) into theBinSubnetMask
+    put baseconvert(char 1 to 8 of theBinSubnetMask, 2, 10) into item 1 of theSubnetMask
+    put baseconvert(char 9 to 16 of theBinSubnetMask, 2, 10) into item 2 of theSubnetMask
+    put baseconvert(char 17 to 24 of theBinSubnetMask, 2, 10) into item 3 of theSubnetMask
+    put baseconvert(char 25 to 32 of theBinSubnetMask, 2, 10) into item 4 of theSubnetMask
+#    put char 1 to theCIDRDelim -1 of theIPAddress into theIPAddress
+  else
+    -- subnet mask octets must be 4 numbers between 0 and 255
+    -- and all octets after the first octet less than 255 must be 0
+    
+    if the number of items of theSubnetMask <>4 \
+          or the last char of theSubnetMask is "." \
+          or ".." is in theSubnetMask then
+      return "ERROR: The Subnet Mask must be in the form:" & cr & \
+            "'nnn.nnn.nnn.nnn' (subnetmask = '" & theSubnetMask & "')"
+    end if
+    
+    put false into mustBeZero
+    repeat for each item theOctet in theSubnetMask
+      
+      if theOctet <0 or theOctet >255 then
+        return "Each octet in the subnet mask must be a number between 0 and 255. " & \
+              "(subnetmask = '" & theSubnetMask & "')"
+      end if
+      
+      if mustBeZero and theOctet >0 then
+        return "ERROR: All octets after an octet less than 255 must be 0. " & \
+              "(subnetmask = '" & theSubnetMask & "')"
+      end if
+      
+      if theOctet <255 then
+        put true into mustBeZero
+      end if
+    end repeat
+    
+    -- convert the subnet mask to binary
+    put 0 into whichOctet
+    repeat for each item theOctet in theSubnetMask
+      add 1 to whichOctet
+      
+      -- subnet mask must contain only 4 octets
+      if whichOctet >4 then
+        return "ERROR: The Subnet Mask must contain 4 numbers between 0 and 255 " & \
+              "separated by periods. (subnetmask = '" & theSubnetMask &"')"
+      end if
+      
+      put value(baseConvert(theOctet, 10, 2)) after theBinSubnetMask
+    end repeat
+    put offset("0", theBinSubnetMask) -1 into theCIDRDepth
+  end if
+  
+  -- CIDR depth must be between 0 and 32
+  if theCIDRDepth <0 or theCIDRDepth >32 then
+    return "ERROR: The CIDR Depth must be between 0 and 32. " & \
+          "(CIDRDepth = '" & theCIDRDepth & "')"
+  end if
+  
+  -- All octets of the IP address must be between 0 and 255
+  repeat for each item theOctet in theIPAddress
+    if theOctet is empty or theOctet < 0 or theOctet > 255 then
+      return "ERROR: Each IP Address octet must be a number between 0 and 255. " & \
+            "(ipaddress = '" & theIPAddress & "')"
+    end if
+  end repeat
+  
+  -- convert the ip address to binary
+  put 0 into whichOctet
+  repeat for each item theOctet in theIPAddress
+    add 1 to whichOctet
+    put baseConvert(theOctet, 10, 2) into theBinValue
+    add 0 to theBinValue
+    put theBinValue after theBinIPAddress
+  end repeat
+  
+  -- calculate the binary subnet address
+  put char 1 to theCIDRDepth of theBinIPAddress into theBinNetworkAddr
+  put char theCIDRDepth +1 to -1 of theBinIPAddress into theBinNodeAddr
+  put theBinNodeAddr into theBinSubnetNodeAddr
+  set the numberFormat to "0"
+  replace "1" with "0" in theBinSubnetNodeAddr
+  put theBinNetworkAddr & theBinSubnetNodeAddr into theBinSubnetAddr
+  
+  -- convert the binary subnet address to decimal
+  put baseconvert(char 1 to 8 of theBinSubnetAddr, 2, 10)  into item 1 of theSubnetAddr
+  put baseconvert(char 9 to 16 of theBinSubnetAddr, 2, 10)  into item 2 of theSubnetAddr
+  put baseconvert(char 17 to 24 of theBinSubnetAddr, 2, 10)  into item 3 of theSubnetAddr
+  put baseconvert(char 25 to 32 of theBinSubnetAddr, 2, 10)  into item 4 of theSubnetAddr
+  
+  -- calculate the first usable IP address
+  put theSubnetAddr into theFirstAddr
+  add 1 to item 4 of theFirstAddr
+  
+  -- calculate the binary broadcast address
+  put theBinNodeAddr into theBinBcastNodeAddr
+  replace "0" with "1" in theBinBcastNodeAddr
+  # put theBinNetworkAddr & theBinBcastNodeAddr into theBinBcastAddr
+  
+  -- convert the binary broadcast address to decimal
+  #   put baseconvert(char 1 to 8 of theBinBcastAddr, 2, 10) into item 1 of theBcastAddr
+  #   put baseconvert(char 9 to 16 of theBinBcastAddr, 2, 10) into item 2 of theBcastAddr
+  #   put baseconvert(char 17 to 24 of theBinBcastAddr, 2, 10) into item 3 of theBcastAddr
+  #   put baseconvert(char 25 to 32 of theBinBcastAddr, 2, 10) into item 4 of theBcastAddr
+  
+  -- calculate the last usable IP address
+  #   put theBcastAddr into theLastAddr
+  #   subtract 1 from item 4 of theLastAddr
+  
+  -- calculate the number of usable addresses
+  -- put item 4 of theLastAddr - item 4 of theFirstAddr +1 into theAddrCount
+  put baseconvert(theBinBcastNodeAddr, 2, 10) -1 into theAddrCount
+  
+  -- calculate the CIDR notation
+  #   put theIPAddress & "/" & theCIDRDepth into theCIDRAddr
+  
+  -- create array
+  put theIPAddress into ipdata ["ipaddress"]
+  put theSubnetMask into ipdata ["subnetmask"]
+  put theSubnetAddr into ipdata ["subnetaddr"]
+  put theFirstAddr into ipdata ["firstaddr"]
+  #   put theBcastAddr into ipdata["bcastaddr"]
+  #   put theLastAddr into ipdata ["lastaddr"]
+  put theCIDRDepth into ipdata ["cidrdepth"]
+  put theAddrCount into ipdata ["usablecount"]
+  #   put theCIDRAddr into ipdata ["cidraddr"]
+  return ipdata
+end IPCalc
+
+function IPCalc_charx theChar, theCount
+  if theChar = "1" then
+    return char 1 to theCount of "11111111111111111111111111111111"
+  else
+    return char 1 to theCount of "00000000000000000000000000000000"
+  end if
+end IPCalc_charx
+
+# sqilite3 embade with module to provide isolated sqlite access
+function sqlite3_f_query dbID,sqlcmd,@sql
+  # query the dataID with sqlcmd, unpack sqlp[]
+  put revQueryDatabase(dbID,sqlcmd) into dataID
+
+  if dataID is not a number then
+    return sqlite3_f_error("sqlite3_f_query `"& dataID &"` "& sqlcmd,dbID)
+  end if
+
+  get sqlite3_f_unpack(dataID,sql)
+end sqlite3_f_query
+
+function sqlite3_f_unpack dataID,@sql
+  # unpack record from query into mc sql array
+  put revNumberOfRecords(dataID) into kmax
+  put kmax into sql["_row"]
+
+  put revDatabaseColumnNames(dataID) into colname
+  put colname into sql["_fld"]
+
+  repeat with k = 1 to kmax
+    put "" into recChunk
+    repeat for each item thekey in colname
+      put revDatabaseColumnNamed(dataID,thekey) into sql[thekey,k]
+    end repeat
+
+    revMoveToNextRecord dataID
+  end repeat
+
+end sqlite3_f_unpack
+
+function sqlite3_f_open spec,dbFile
+  # open the db, init if not there
+  # spec = _host: the domain the db create
+  global pSQLITEdb
+  if pSQLITEdb[dbFile] is a number then return pSQLITEdb[dbFile] # already open
+
+  repeat 3
+    try
+      put revOpenDatabase("sqlite",dbFile) into dbID
+    catch errornum
+      repeat for each item i in the globals
+        put i &"="& value(i) & cr after buffer
+      end repeat
+      get sqlite3_f_error("sqlite3 geoloc revOpenDatabase() error dbID: '"& dbID &"'")
+      wait 1 second
+
+    finally
+      # good to go
+      exit repeat
+    end try
+  end repeat
+
+  if dbID is not a number then
+    get sqlite3_f_error("sqlite3_f_open db open failed "& dbFile)
+  end if
+
+#  put dbID into gMBOXdb[dbpath]
+  put dbID into   pSQLITEdb[dbFile] # path to db
+  put dbFile into pSQLITEdb[dbID]   # id to file
+
+  return dbID
+end sqlite3_f_open
+
+function sqlite3_f_error txt,idx
+  # db operation error, log down, ui respose, exit to top
+  global pSQLITEdb
+
+  put keys(pSQLITEdb) into tmpk
+  replace cr with ";" in tmpk
+  put the date && the time && tmpk && idx && txt & cr into tmp
+  put tmp after url ("file:geoloc.sqlite3.debug")
+
+  return true
+end sqlite3_f_error
+
+function geoloc_response key1
+  # return the geo info
+  put "text/plain" into gHttp["Content-type:"]
+
+  put keys(key1) into keylist
+  sort keylist
+
+  switch gCgi["format"]
+  case "json"
+    put "application/json" into gHttp["Content-type:"]
+    put "{`geoinfo`: {"& cr after htmltmp
+    repeat for each line thekey in keylist
+      put "`"& thekey &"`: `"& key1[thekey] &"`," after htmltmp
+    end repeat
+    delete last char of htmltmp
+    put "}}" after htmltmp
+    replace "`" with quote in htmltmp
+    break
+
+  case "xml"
+    put "text/xml" into gHttp["Content-type:"]
+
+    put "<?xml version="& quote &"1.0"& quote &"?><login>"& cr into htmltmp
+    put array2xml(key1) after htmltmp
+    put "</login>" after htmltmp
+    break
+
+  case "js-prototype"
+    # return as javascript stored prototype
+    put "text/javascript" into gHttp["Content-type:"]
+    put "function geoloc() {"& cr after htmltmp
+    repeat for each line thekey in keylist
+      put "this."& thekey &" = `"& key1[thekey] &"`;"& cr after htmltmp
+    end repeat
+    replace "`" with quote in htmltmp
+    put "}" after htmltmp
+    break
+    # sample javascript code in browser
+    # <script type="text/javascript" src="http://your-domain.com/geoloc.lc?format=js-prototype"></script>
+    # <script type="text/javascript">
+    #   var loc = new geoloc();
+    #   if (loc.country === "MY") {
+    #     alert("Bingo Malaysia");
+    #      // go to some page?
+    #      //window.location.href="/malaysia-places";
+    #   } 
+    #   else {
+    #     //window.location.href="/world-places";
+    #   };
+    # </script>
+
+  case "internal"
+    # in within livecode environment
+    return key1
+    break
+
+  default
+    put "https://maps.google.com/maps?q="& key1["latitude"] &","& key1["longitude"] into key1["google_map_link"]
+    put cr &"google_map_link" after keylist
+    repeat for each line thekey in keylist
+      replace cr with "\n" in key1[thekey]
+
+      put thekey &":"& key1[thekey] & cr after htmltmp
+    end repeat
+    break
+  end switch
+  
+  return htmltmp
+end geoloc_response
+
+function array2xml xArray
+  # assign array data into xml
+  delete local xArray["keys"]
+  put keys(xArray) into xlist
+  put "" into rawdata
+  repeat for each line xitem in xlist
+    if xitem = "" then next repeat
+    put "<"& xitem &">"& \
+      xArray[xitem] &"</"& xitem &">"& cr after rawdata
+  end repeat
+  delete last char of rawdata
+  return rawdata
+end array2xml
+?>
