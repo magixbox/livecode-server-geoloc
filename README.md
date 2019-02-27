@@ -1,5 +1,8 @@
+<<<<<<< HEAD
 # geoloc
 
+=======
+>>>>>>> b2c24204b5af0dbfa240f57a7578c4b93d9db297
 Livecode server geoloc service
 ======================================================
 Support query with ip, like geoloc.lc?ip=xx.xx.xxx.xx
@@ -17,6 +20,5 @@ See seperate note for creating the database or download it here at:
 All source code here:-
   https://github.com/magixbox/livecode-server-geoloc
 
-by bei 
-magixbox@gmail.com
+by BEI: magixbox at gmail 
 2019-02
