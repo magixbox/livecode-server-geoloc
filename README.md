@@ -1,6 +1,5 @@
 # geoloc
 
-======================================================
 Livecode server geoloc service
 ======================================================
 Support query with ip, like geoloc.lc?ip=xx.xx.xxx.xx

@@ -27,7 +27,7 @@ global gHttp
 
 # sqlite3 database, full path if it is not staying at the same location
 constant tGeoDb    = "geoloc.db"
-constant tVerBuild = "2.0"
+constant tVerBuild = "2.0.1"
 
 geoloc
 
@@ -57,6 +57,9 @@ function geoloc_get theIP
 
   put "ERR" into geoinfo["_status"]
   if theIP = "" then return geoinfo
+  
+  # sql injection prevention
+  replace "'" with "" in theIP
 
   # block database
   set itemdel to "."
@@ -101,6 +104,8 @@ function geoloc_get theIP
   # cache it
   get geoloc_cache_set(theIP,geoinfo,dbID)
 
+  # insert maxmind
+  put "GeoLite2 data by https://www.maxmind.com" into geoinfo["_credit"]
   return geoinfo
 end geoloc_get
 
@@ -513,7 +518,7 @@ function geoloc_response key1
   put keys(key1) into keylist
   sort keylist
 
-  switch gCgi["format"]
+  switch $_GET["format"]
   case "json"
     put "application/json" into gHttp["Content-type:"]
     put "{`geoinfo`: {"& cr after htmltmp
